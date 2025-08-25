@@ -25,11 +25,11 @@ logging.basicConfig(
 
 # Database configuration - используем переменные окружения
 DB_CONFIG = {
-    'host': os.environ.get('DB_HOST', '109.71.245.217'),
-    'port': os.environ.get('DB_PORT', '5432'),
-    'dbname': os.environ.get('DB_NAME', 'Cornerstone'),
-    'user': os.environ.get('DB_USER', 'postgres'),
-    'password': os.environ.get('DB_PASSWORD', '183492awedxzs')
+    'host': os.environ.get('DB_HOST', '*'),
+    'port': os.environ.get('DB_PORT', '*'),
+    'dbname': os.environ.get('DB_NAME', '*'),
+    'user': os.environ.get('DB_USER', '*'),
+    'password': os.environ.get('DB_PASSWORD', '*')
 }
 
 # PlantUML configuration
