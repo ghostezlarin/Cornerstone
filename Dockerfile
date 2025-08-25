@@ -1,0 +1,31 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    default-jre \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование requirements и установка Python зависимостей
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копирование приложения
+COPY app.py .
+
+# Создание директории для файлов UML
+RUN mkdir -p uml_files
+
+# Загрузка plantuml.jar
+RUN curl -L -o plantuml.jar https://github.com/plantuml/plantuml/releases/download/v1.2023.12/plantuml-1.2023.12.jar
+
+# Установка переменных окружения
+ENV PLANTUML_JAR_PATH=/app/plantuml.jar
+ENV FLASK_APP=app.py
+ENV FLASK_ENV=production
+
+EXPOSE 5000
+
+CMD ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=5000"]

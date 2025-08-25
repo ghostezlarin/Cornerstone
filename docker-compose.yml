@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # PlantUML как веб-сервис
+  plantuml-server:
+    image: plantuml/plantuml-server:tomcat
+    container_name: plantuml-server
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - diagram-network
+
+  # Flask приложение
+  diagram-app:
+    build: .
+    container_name: diagram-app
+    ports:
+      - "5000:5000"
+    environment:
+      - PLANTUML_JAR_PATH=/app/plantuml.jar
+      - PLANTUML_SERVER_URL=http://plantuml-server:8080
+      - DB_HOST=*
+      - DB_PORT=*
+      - DB_NAME=*
+      - DB_USER=*
+      - DB_PASSWORD=*
+    volumes:
+      - uml_data:/app/uml_files
+    depends_on:
+      - plantuml-server
+    restart: unless-stopped
+    networks:
+      - diagram-network
+
+  # Nginx для обратного прокси
+  nginx:
+    image: nginx:alpine
+    container_name: diagram-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - diagram-app
+    restart: unless-stopped
+    networks:
+      - diagram-network
+
+volumes:
+  uml_data:
+
+networks:
+  diagram-network:
+    driver: bridge
