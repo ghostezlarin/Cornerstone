@@ -16,11 +16,11 @@ services:
     environment:
       - PLANTUML_JAR_PATH=/app/plantuml.jar
       - PLANTUML_SERVER_URL=http://plantuml-server:8080
-      - DB_HOST=109.71.245.217
-      - DB_PORT=5432
-      - DB_NAME=Cornerstone
-      - DB_USER=postgres
-      - DB_PASSWORD=183492awedxzs
+      - DB_HOST=*
+      - DB_PORT=*
+      - DB_NAME=*
+      - DB_USER=*
+      - DB_PASSWORD=*
     volumes:
       - uml_data:/app/uml_files
     depends_on:
