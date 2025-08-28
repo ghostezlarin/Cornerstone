@@ -9,7 +9,6 @@ from datetime import datetime
 from flask import Flask, Response, request, redirect
 import psycopg2
 import requests
-from urllib.parse import quote
 
 app = Flask(__name__)
 
@@ -34,7 +33,7 @@ DB_CONFIG = {
 
 # PlantUML configuration
 PLANTUML_JAR_PATH = os.environ.get('PLANTUML_JAR_PATH', 'plantuml.jar')
-PLANTUML_SERVER_URL = os.environ.get('PLANTUML_SERVER_URL', 'http://localhost:8080')
+PLANTUML_SERVER_URL = os.environ.get('PLANTUML_SERVER_URL', 'http://plantuml-server:8080')
 UML_STORAGE_DIR = 'uml_files'
 os.makedirs(UML_STORAGE_DIR, exist_ok=True)
 
@@ -126,9 +125,17 @@ class DiagramService:
             (r'\\"', '"'),
             (r'\\{\\}', ''),
             (r'\\./', './'),
+            (r'include <c4/', '!include <C4/'),  # Исправляем регистр
+            (r'#include', '!include'),  # Исправляем неправильные директивы
+            (r'linclude', '!include'),  # Исправляем опечатки
+            (r'Lunquoted', '!unquoted'),  # Исправляем опечатки
+            (r'lendprocedure', '!endprocedure'),  # Исправляем опечатки
+            (r'!!include', '!include'),  # Исправляем двойной !
         ]
+
         for pattern, replacement in fixes:
             puml = re.sub(pattern, replacement, puml)
+
         return puml
 
     @staticmethod
@@ -212,6 +219,7 @@ class DiagramService:
                 'java', '-jar', jar_path,
                 '-tsvg',
                 '-charset', 'UTF-8',
+                '-failfast2',  # Не генерировать SVG при ошибках
                 temp_puml_path
             ]
 
@@ -231,6 +239,11 @@ class DiagramService:
             if result.stderr and result.stderr.strip():
                 logging.error(f"PlantUML stderr: {result.stderr}")
 
+            # Проверяем наличие ошибок
+            if result.stderr and ("error" in result.stderr.lower() or "fail" in result.stderr.lower()):
+                logging.error(f"PlantUML generation failed with errors: {result.stderr}")
+                return None
+
             # Check if SVG file was created
             if os.path.exists(temp_svg_path):
                 logging.info(f"SVG file created successfully: {temp_svg_path}")
@@ -247,22 +260,6 @@ class DiagramService:
                     return None
             else:
                 logging.error(f"SVG file was not created: {temp_svg_path}")
-                logging.error(f"Expected SVG path: {temp_svg_path}")
-
-                # Проверим, какие файлы вообще создались
-                temp_dir = os.path.dirname(temp_puml_path)
-                all_files = os.listdir(temp_dir)
-                logging.error(f"Files in temp directory: {all_files}")
-
-                # Check if temporary PUML file exists and log its content
-                if os.path.exists(temp_puml_path):
-                    logging.info(f"Temporary PUML file exists: {temp_puml_path}")
-                    with open(temp_puml_path, 'r', encoding='utf-8') as f:
-                        temp_content = f.read()
-                    logging.info(f"Temporary file content (first 500 chars):\n{temp_content[:500]}")
-                else:
-                    logging.error("Temporary PUML file also doesn't exist")
-
                 return None
 
         except subprocess.TimeoutExpired:
@@ -278,21 +275,19 @@ class DiagramService:
                     os.unlink(temp_puml_path)
                 if temp_svg_path and os.path.exists(temp_svg_path):
                     os.unlink(temp_svg_path)
-
-                # Также удаляем возможные файлы с двойным расширением .puml.svg
-                double_extension_path = temp_puml_path + '.svg' if temp_puml_path else None
-                if double_extension_path and os.path.exists(double_extension_path):
-                    logging.info(f"Cleaning up double extension file: {double_extension_path}")
-                    os.unlink(double_extension_path)
-
             except OSError as e:
                 logging.warning(f"Failed to clean up temp files: {e}")
 
     @staticmethod
     def generate_svg_with_server(puml: str, filename_prefix: str) -> Optional[str]:
-        """Generates SVG using PlantUML server"""
+        """Generates SVG using PlantUML server with POST request"""
         try:
-            logging.info("Using PlantUML server for generation")
+            # Проверяем длину PlantUML кода
+            if len(puml) > 10000:
+                logging.warning(f"PlantUML code too long for server ({len(puml)} chars), using local generation")
+                return None
+
+            logging.info("Using PlantUML server for generation with POST")
 
             # Sanitize PlantUML code first
             puml = DiagramService.sanitize_puml(puml)
@@ -301,26 +296,29 @@ class DiagramService:
             debug_file = DiagramService.save_puml_file(puml, filename_prefix)
             logging.info(f"Saved debug PlantUML to: {debug_file}")
 
-            # Кодируем PlantUML код
-            encoded_puml = quote(puml)
+            # Формируем URL для PlantUML сервера (POST endpoint)
+            plantuml_url = f"{PLANTUML_SERVER_URL}/svg"
 
-            # Формируем URL для PlantUML сервера
-            plantuml_url = f"{PLANTUML_SERVER_URL}/svg/{encoded_puml}"
+            logging.info(f"Requesting PlantUML server via POST: {plantuml_url}")
+            logging.info(f"PlantUML content length: {len(puml)} characters")
 
-            logging.info(f"Requesting PlantUML server: {plantuml_url[:100]}...")
+            # Используем POST запрос вместо GET чтобы избежать длинных URL
+            headers = {'Content-Type': 'text/plain; charset=utf-8'}
+            response = requests.post(plantuml_url, data=puml.encode('utf-8'),
+                                     headers=headers, timeout=30)
 
-            response = requests.get(plantuml_url, timeout=30)
-
-            if response.status_code == 200:
+            # Проверяем, если сервер возвращает SVG даже при статусе 400
+            if response.status_code in [200, 400]:  # Принимаем и 400 статус
                 svg_content = response.text
                 if '<svg' in svg_content.lower():
-                    logging.info("PlantUML server generation successful")
+                    logging.info(f"PlantUML server generation successful (status {response.status_code})")
                     return svg_content
                 else:
-                    logging.error("PlantUML server returned invalid SVG content")
+                    logging.error("PlantUML server returned invalid content")
                     logging.error(f"Response content starts with: {svg_content[:200]}")
             else:
                 logging.error(f"PlantUML server failed - status: {response.status_code}")
+                logging.error(f"Response text: {response.text[:200]}")
 
             return None
 
@@ -339,7 +337,7 @@ class DiagramService:
             logging.error("Invalid or empty PlantUML content")
             return None
 
-        # Try local generation first if jar exists and Java is available
+        # Всегда сначала пробуем локальную генерацию
         jar_path = PLANTUML_JAR_PATH
         if os.path.exists(jar_path):
             try:
@@ -348,12 +346,16 @@ class DiagramService:
                 svg = DiagramService.generate_svg_with_jar(puml, filename_prefix)
                 if svg:
                     return svg
-                logging.warning("Local generation failed, trying server...")
-            except Exception:
-                logging.warning("Java not available for local generation, using server...")
+                logging.warning("Local generation failed")
+            except Exception as e:
+                logging.warning(f"Java not available for local generation: {e}")
 
-        # If local generation fails or not available, try server
-        return DiagramService.generate_svg_with_server(puml, filename_prefix)
+        # Если локальная генерация не удалась, пробуем сервер (только для коротких кодов)
+        if len(puml) <= 10000:
+            return DiagramService.generate_svg_with_server(puml, filename_prefix)
+        else:
+            logging.error("PlantUML code too long for server fallback")
+            return None
 
 
 @app.route('/')

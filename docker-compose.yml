@@ -5,8 +5,6 @@ services:
   plantuml-server:
     image: plantuml/plantuml-server:tomcat
     container_name: plantuml-server
-    ports:
-      - "8080:8080"
     restart: unless-stopped
     networks:
       - diagram-network
@@ -15,16 +13,14 @@ services:
   diagram-app:
     build: .
     container_name: diagram-app
-    ports:
-      - "5000:5000"
     environment:
       - PLANTUML_JAR_PATH=/app/plantuml.jar
       - PLANTUML_SERVER_URL=http://plantuml-server:8080
-      - DB_HOST=*
-      - DB_PORT=*
-      - DB_NAME=*
-      - DB_USER=*
-      - DB_PASSWORD=*
+      - DB_HOST=109.71.245.217
+      - DB_PORT=5432
+      - DB_NAME=Cornerstone
+      - DB_USER=postgres
+      - DB_PASSWORD=183492awedxzs
     volumes:
       - uml_data:/app/uml_files
     depends_on:
@@ -33,16 +29,19 @@ services:
     networks:
       - diagram-network
 
-  # Nginx для обратного прокси
+  # Nginx как обратный прокси
   nginx:
     image: nginx:alpine
     container_name: diagram-nginx
     ports:
       - "80:80"
+      - "443:443"  # для HTTPS в будущем
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./logs:/var/log/nginx
     depends_on:
       - diagram-app
+      - plantuml-server
     restart: unless-stopped
     networks:
       - diagram-network
