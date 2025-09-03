@@ -33,9 +33,12 @@ DB_CONFIG = {
 
 # PlantUML configuration
 PLANTUML_JAR_PATH = os.environ.get('PLANTUML_JAR_PATH', 'plantuml.jar')
-PLANTUML_SERVER_URL = os.environ.get('PLANTUML_SERVER_URL', 'http://plantuml-server:8080')
+PLANTUML_SERVER_URL = os.environ.get('PLANTUML_SERVER_URL', 'http://localhost:8080')
 UML_STORAGE_DIR = 'uml_files'
 os.makedirs(UML_STORAGE_DIR, exist_ok=True)
+
+# Глобальная переменная для кэширования PlantUML кода
+PLANTUML_CACHE = {}
 
 
 class DiagramService:
@@ -65,6 +68,16 @@ class DiagramService:
     def get_puml_from_db(params: Dict[str, Any]) -> Optional[str]:
         """Gets PlantUML code from database using f_GetDiagram2 function with JSONB parameters"""
         try:
+            # Создаем ключ для кэширования
+            cache_key = json.dumps(params, sort_keys=True)
+
+            # Проверяем кэш
+            if cache_key in PLANTUML_CACHE:
+                logging.info(f"Cache hit for key: {cache_key}")
+                return PLANTUML_CACHE[cache_key]
+
+            logging.info(f"Cache miss for key: {cache_key}")
+
             with psycopg2.connect(**DB_CONFIG) as conn:
                 with conn.cursor() as cur:
                     # Prepare parameters for JSONB function - используем все переданные параметры
@@ -88,6 +101,8 @@ class DiagramService:
 
                     result = cur.fetchone()
                     if result and result[0]:
+                        # Сохраняем в кэш
+                        PLANTUML_CACHE[cache_key] = result[0]
                         return result[0]
                     else:
                         logging.warning("No result returned from database")
@@ -139,28 +154,8 @@ class DiagramService:
         return puml
 
     @staticmethod
-    def check_plantuml_jar() -> bool:
-        """Check if plantuml.jar exists or server is available"""
-        jar_path = PLANTUML_JAR_PATH
-
-        logging.info(f"Checking PlantUML jar at: {jar_path}")
-        logging.info(f"PLANTUML_JAR_PATH env variable: {os.environ.get('PLANTUML_JAR_PATH', 'Not set')}")
-
-        # Проверка локального jar
-        if os.path.exists(jar_path):
-            # Проверка Java
-            try:
-                result = subprocess.run(['java', '-version'], capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    logging.info(
-                        f"Local PlantUML: OK (Java: {result.stderr.splitlines()[0] if result.stderr else 'Unknown'})")
-                    return True
-            except Exception as e:
-                logging.warning(f"Local Java not available: {e}, will use PlantUML server")
-        else:
-            logging.warning(f"PlantUML jar not found at: {jar_path}")
-
-        # Проверка доступности PlantUML сервера
+    def check_plantuml_server() -> bool:
+        """Check if PlantUML server is available"""
         try:
             response = requests.get(f"{PLANTUML_SERVER_URL}/", timeout=5)
             if response.status_code == 200:
@@ -168,123 +163,18 @@ class DiagramService:
                 return True
             else:
                 logging.warning(f"PlantUML server responded with status: {response.status_code}")
+                return False
         except Exception as e:
             logging.warning(f"PlantUML server not available: {e}")
-
-        logging.error("No PlantUML generation method available")
-        return False
-
-    @staticmethod
-    def generate_svg_with_jar(puml: str, filename_prefix: str) -> Optional[str]:
-        """Generates SVG from PlantUML using local plantuml.jar"""
-        temp_puml_path = None
-        temp_svg_path = None
-
-        try:
-            if not puml or len(puml.strip()) < 10:
-                logging.error("Empty or too short PlantUML code provided")
-                return None
-
-            # Check if plantuml.jar and Java are available
-            jar_path = PLANTUML_JAR_PATH
-            if not os.path.exists(jar_path):
-                logging.error(f"PlantUML jar not found at: {jar_path}")
-                return None
-
-            # Проверка Java
-            try:
-                subprocess.run(['java', '-version'], capture_output=True, text=True, timeout=5, check=True)
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-                logging.error(f"Java is not available: {e}")
-                return None
-
-            # Sanitize PlantUML code first
-            puml = DiagramService.sanitize_puml(puml)
-
-            # Save PlantUML for debugging
-            debug_file = DiagramService.save_puml_file(puml, filename_prefix)
-            logging.info(f"Saved debug PlantUML to: {debug_file}")
-
-            # Create temporary file with .puml extension
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.puml', delete=False, encoding='utf-8') as temp_puml:
-                temp_puml.write(puml)
-                temp_puml_path = temp_puml.name
-
-            # PlantUML автоматически добавляет .svg к имени входного файла
-            base_path = temp_puml_path.rsplit('.', 1)[0]  # Убираем .puml
-            temp_svg_path = base_path + '.svg'
-
-            # Run PlantUML to generate SVG
-            cmd = [
-                'java', '-jar', jar_path,
-                '-tsvg',
-                '-charset', 'UTF-8',
-                '-failfast2',  # Не генерировать SVG при ошибках
-                temp_puml_path
-            ]
-
-            logging.info(f"Executing PlantUML command: {' '.join(cmd)}")
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            # Detailed logging
-            logging.info(f"PlantUML return code: {result.returncode}")
-            if result.stdout and result.stdout.strip():
-                logging.info(f"PlantUML stdout: {result.stdout}")
-            if result.stderr and result.stderr.strip():
-                logging.error(f"PlantUML stderr: {result.stderr}")
-
-            # Проверяем наличие ошибок
-            if result.stderr and ("error" in result.stderr.lower() or "fail" in result.stderr.lower()):
-                logging.error(f"PlantUML generation failed with errors: {result.stderr}")
-                return None
-
-            # Check if SVG file was created
-            if os.path.exists(temp_svg_path):
-                logging.info(f"SVG file created successfully: {temp_svg_path}")
-                with open(temp_svg_path, 'r', encoding='utf-8') as f:
-                    svg_content = f.read()
-
-                # Validate SVG content
-                if '<svg' in svg_content.lower():
-                    logging.info("Valid SVG content generated")
-                    return svg_content
-                else:
-                    logging.error("SVG file exists but doesn't contain valid SVG content")
-                    logging.error(f"File content starts with: {svg_content[:200]}")
-                    return None
-            else:
-                logging.error(f"SVG file was not created: {temp_svg_path}")
-                return None
-
-        except subprocess.TimeoutExpired:
-            logging.error("PlantUML generation timed out")
-            return None
-        except Exception as e:
-            logging.error(f"SVG generation with plantuml.jar failed: {str(e)}", exc_info=True)
-            return None
-        finally:
-            # Clean up temporary files
-            try:
-                if temp_puml_path and os.path.exists(temp_puml_path):
-                    os.unlink(temp_puml_path)
-                if temp_svg_path and os.path.exists(temp_svg_path):
-                    os.unlink(temp_svg_path)
-            except OSError as e:
-                logging.warning(f"Failed to clean up temp files: {e}")
+            return False
 
     @staticmethod
     def generate_svg_with_server(puml: str, filename_prefix: str) -> Optional[str]:
         """Generates SVG using PlantUML server with POST request"""
         try:
             # Проверяем длину PlantUML кода
-            if len(puml) > 10000:
-                logging.warning(f"PlantUML code too long for server ({len(puml)} chars), using local generation")
+            if len(puml) > 100000:  # Увеличиваем лимит для сервера
+                logging.warning(f"PlantUML code too long for server ({len(puml)} chars)")
                 return None
 
             logging.info("Using PlantUML server for generation with POST")
@@ -292,9 +182,10 @@ class DiagramService:
             # Sanitize PlantUML code first
             puml = DiagramService.sanitize_puml(puml)
 
-            # Save PlantUML for debugging
-            debug_file = DiagramService.save_puml_file(puml, filename_prefix)
-            logging.info(f"Saved debug PlantUML to: {debug_file}")
+            # Save PlantUML for debugging (только для отладки)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                debug_file = DiagramService.save_puml_file(puml, filename_prefix)
+                logging.debug(f"Saved debug PlantUML to: {debug_file}")
 
             # Формируем URL для PlantUML сервера (POST endpoint)
             plantuml_url = f"{PLANTUML_SERVER_URL}/svg"
@@ -331,31 +222,14 @@ class DiagramService:
 
     @staticmethod
     def generate_svg(puml: str, filename_prefix: str) -> Optional[str]:
-        """Main SVG generation method - tries local jar first, then server"""
+        """Main SVG generation method - uses PlantUML server only"""
         # Basic validation
         if not puml or len(puml.strip()) < 10:
             logging.error("Invalid or empty PlantUML content")
             return None
 
-        # Всегда сначала пробуем локальную генерацию
-        jar_path = PLANTUML_JAR_PATH
-        if os.path.exists(jar_path):
-            try:
-                # Проверяем доступность Java
-                subprocess.run(['java', '-version'], capture_output=True, text=True, timeout=5, check=True)
-                svg = DiagramService.generate_svg_with_jar(puml, filename_prefix)
-                if svg:
-                    return svg
-                logging.warning("Local generation failed")
-            except Exception as e:
-                logging.warning(f"Java not available for local generation: {e}")
-
-        # Если локальная генерация не удалась, пробуем сервер (только для коротких кодов)
-        if len(puml) <= 10000:
-            return DiagramService.generate_svg_with_server(puml, filename_prefix)
-        else:
-            logging.error("PlantUML code too long for server fallback")
-            return None
+        # Всегда используем PlantUML сервер
+        return DiagramService.generate_svg_with_server(puml, filename_prefix)
 
 
 @app.route('/')
@@ -408,7 +282,7 @@ def get_diagram_svg():
             return Response("Diagram not found", status=404)
 
         # Log the PlantUML content for debugging
-        logging.info(f"Retrieved PlantUML content (first 200 chars): {puml[:200]}...")
+        logging.debug(f"Retrieved PlantUML content (first 200 chars): {puml[:200]}...")
 
         # Create filename prefix for logging
         diagram_type = params.get('type', 'unknown')
@@ -467,14 +341,12 @@ def health_check():
                 cur.execute("SELECT 1")
 
         # Check PlantUML availability
-        plantuml_ok = DiagramService.check_plantuml_jar()
+        plantuml_ok = DiagramService.check_plantuml_server()
 
         health_status = {
             'status': 'healthy',
             'database': 'connected',
             'plantuml': 'available' if plantuml_ok else 'unavailable',
-            'plantuml_jar_path': PLANTUML_JAR_PATH,
-            'plantuml_jar_exists': os.path.exists(PLANTUML_JAR_PATH),
             'plantuml_server_url': PLANTUML_SERVER_URL,
             'timestamp': datetime.now().isoformat()
         }
@@ -518,8 +390,6 @@ if __name__ == '__main__':
     # Check dependencies on startup
     logging.info("Starting Diagram Service...")
     logging.info("Checking dependencies:")
-    logging.info(f"PlantUML jar path: {PLANTUML_JAR_PATH}")
-    logging.info(f"PLANTUML_JAR_PATH env: {os.environ.get('PLANTUML_JAR_PATH', 'Not set')}")
     logging.info(f"PlantUML server URL: {PLANTUML_SERVER_URL}")
 
     # Check database
@@ -529,10 +399,10 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning(f"Database connection: FAILED - {e}")
 
-    # Check PlantUML
-    if DiagramService.check_plantuml_jar():
-        logging.info("PlantUML: OK")
+    # Check PlantUML server
+    if DiagramService.check_plantuml_server():
+        logging.info("PlantUML server: OK")
     else:
-        logging.warning("PlantUML: FAILED - make sure plantuml.jar is available or server is running")
+        logging.warning("PlantUML server: FAILED - make sure PlantUML server is running")
 
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)  # Отключаем debug для production

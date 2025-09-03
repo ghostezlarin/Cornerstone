@@ -4,8 +4,7 @@ WORKDIR /app
 
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
-    default-jre \
-    wget \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование requirements и установка Python зависимостей
@@ -18,14 +17,12 @@ COPY app.py .
 # Создание директории для файлов UML
 RUN mkdir -p uml_files
 
-# Загрузка plantuml.jar (стабильная версия)
-RUN wget -O plantuml.jar https://github.com/plantuml/plantuml/releases/download/v1.2023.12/plantuml-1.2023.12.jar
-
 # Установка переменных окружения
-ENV PLANTUML_JAR_PATH=/app/plantuml.jar
+ENV PLANTUML_SERVER_URL=http://plantuml-server:8080
 ENV FLASK_APP=app.py
 ENV FLASK_ENV=production
 
 EXPOSE 5000
 
+# Запуск только Flask приложения
 CMD ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=5000"]
