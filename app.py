@@ -2,11 +2,11 @@ import logging
 import re
 import os
 import json
-import subprocess
-import tempfile
-from typing import Optional, Dict, Any
+import time
+import threading
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
-from flask import Flask, Response, request, redirect
+from flask import Flask, Response, request, redirect, jsonify
 import psycopg2
 import requests
 
@@ -32,13 +32,13 @@ DB_CONFIG = {
 }
 
 # PlantUML configuration
-PLANTUML_JAR_PATH = os.environ.get('PLANTUML_JAR_PATH', 'plantuml.jar')
-PLANTUML_SERVER_URL = os.environ.get('PLANTUML_SERVER_URL', 'http://localhost:8080')
+PLANTUML_SERVER_URL = os.environ.get('PLANTUML_SERVER_URL', 'http://plantuml-server:8080')
 UML_STORAGE_DIR = 'uml_files'
 os.makedirs(UML_STORAGE_DIR, exist_ok=True)
 
-# Глобальная переменная для кэширования PlantUML кода
+# Глобальная переменная для кэширования PlantUML кода с timestamp (TTL = 30 секунд)
 PLANTUML_CACHE = {}
+CACHE_TTL_SECONDS = 30
 
 
 class DiagramService:
@@ -49,15 +49,24 @@ class DiagramService:
             if not guid_str:
                 return None
 
+            # Убираем все не-hex символы
             clean_guid = re.sub(r'[^a-fA-F0-9]', '', guid_str.lower())
-            guid_part = clean_guid[1:] if clean_guid.startswith('g') else clean_guid
 
-            if len(guid_part) == 32:
-                formatted = f"{guid_part[:8]}-{guid_part[8:12]}-{guid_part[12:16]}-{guid_part[16:20]}-{guid_part[20:32]}"
+            # Если GUID уже в формате без дефисов
+            if len(clean_guid) == 32:
+                # Форматируем с дефисами
+                formatted = f"{clean_guid[:8]}-{clean_guid[8:12]}-{clean_guid[12:16]}-{clean_guid[16:20]}-{clean_guid[20:32]}"
                 if re.fullmatch(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', formatted):
                     normalized = f"g_{formatted}"
                     logging.info(f"Normalized GUID: {guid_str} -> {normalized}")
                     return normalized
+
+            # Если GUID уже в правильном формате с дефисами
+            if re.fullmatch(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', guid_str.lower()):
+                normalized = f"g_{guid_str.lower()}"
+                logging.info(f"Normalized GUID (already formatted): {guid_str} -> {normalized}")
+                return normalized
+
             logging.warning(f"Invalid GUID format: {guid_str}")
             return None
         except Exception as e:
@@ -71,10 +80,18 @@ class DiagramService:
             # Создаем ключ для кэширования
             cache_key = json.dumps(params, sort_keys=True)
 
-            # Проверяем кэш
+            # Проверяем кэш (TTL = 30 секунд)
             if cache_key in PLANTUML_CACHE:
-                logging.info(f"Cache hit for key: {cache_key}")
-                return PLANTUML_CACHE[cache_key]
+                cached_data = PLANTUML_CACHE[cache_key]
+                cache_time, puml_code = cached_data
+
+                # Проверяем не истек ли TTL
+                if time.time() - cache_time < CACHE_TTL_SECONDS:
+                    logging.info(f"Cache hit for key: {cache_key} (age: {time.time() - cache_time:.1f}s)")
+                    return puml_code
+                else:
+                    logging.info(f"Cache expired for key: {cache_key} (age: {time.time() - cache_time:.1f}s)")
+                    del PLANTUML_CACHE[cache_key]  # Удаляем просроченный кэш
 
             logging.info(f"Cache miss for key: {cache_key}")
 
@@ -101,9 +118,19 @@ class DiagramService:
 
                     result = cur.fetchone()
                     if result and result[0]:
-                        # Сохраняем в кэш
-                        PLANTUML_CACHE[cache_key] = result[0]
-                        return result[0]
+                        puml_code = result[0]
+
+                        # Проверяем, не вернула ли БД сообщение об ошибке
+                        error_indicators = ['error', 'ошибка', 'fail', 'exception', 'invalid']
+                        if any(indicator in puml_code.lower() for indicator in error_indicators):
+                            logging.error(f"Database returned possible error: {puml_code[:100]}...")
+                            # Не кэшируем ошибки!
+                            return None
+
+                        # Сохраняем в кэш с timestamp
+                        PLANTUML_CACHE[cache_key] = (time.time(), puml_code)
+                        logging.info(f"Cached result for key: {cache_key}")
+                        return puml_code
                     else:
                         logging.warning("No result returned from database")
                         return None
@@ -279,10 +306,17 @@ def get_diagram_svg():
 
         puml = DiagramService.get_puml_from_db(params)
         if not puml:
-            return Response("Diagram not found", status=404)
+            return Response("Diagram not found or database error", status=404)
+
+        # Проверяем, не является ли результат ошибкой
+        error_indicators = ['error', 'ошибка', 'fail', 'exception', 'invalid']
+        if any(indicator in puml.lower() for indicator in error_indicators):
+            logging.error(f"Database returned error content: {puml[:200]}...")
+            return Response("Database returned error content", status=500)
 
         # Log the PlantUML content for debugging
         logging.debug(f"Retrieved PlantUML content (first 200 chars): {puml[:200]}...")
+        logging.info(f"Retrieved PlantUML content length: {len(puml)} characters")
 
         # Create filename prefix for logging
         diagram_type = params.get('type', 'unknown')
@@ -331,6 +365,118 @@ def debug_diagram():
         return Response(f"Error: {str(e)}", status=500)
 
 
+@app.route('/api/diagram/debug/guid')
+def debug_guid():
+    """Debug endpoint for GUID normalization"""
+    guid = request.args.get('guid', '')
+    normalized = DiagramService.normalize_guid(guid)
+    return jsonify({
+        'input': guid,
+        'normalized': normalized,
+        'is_valid': normalized is not None
+    })
+
+
+@app.route('/api/diagram/debug/db')
+def debug_db_query():
+    """Debug endpoint to test database query directly"""
+    try:
+        guid = request.args.get('guid', '00000000-0000-0000-0000-000000000001')
+        diagram_type = request.args.get('type', 'WBS')
+
+        params = {
+            'guid': guid,
+            'type': diagram_type,
+            'level': int(request.args.get('level', 1))
+        }
+
+        # Test normalization
+        normalized_guid = DiagramService.normalize_guid(guid)
+
+        # Test database query
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                db_params = params.copy()
+                if normalized_guid:
+                    db_params['guid'] = normalized_guid[2:]  # Remove 'g_' prefix
+
+                cur.execute("""
+                    SELECT main."f_GetDiagram2"(%s::jsonb)
+                """, (json.dumps(db_params),))
+
+                result = cur.fetchone()
+
+        return jsonify({
+            'input_params': params,
+            'normalized_guid': normalized_guid,
+            'db_params': db_params,
+            'db_result': result[0] if result else None,
+            'result_length': len(result[0]) if result else 0
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cache/status')
+def cache_status():
+    """Get cache status and statistics"""
+    cache_size = len(PLANTUML_CACHE)
+    now = time.time()
+
+    # Статистика по возрасту записей
+    age_stats = []
+    for key, (cache_time, _) in PLANTUML_CACHE.items():
+        age = now - cache_time
+        age_stats.append(age)
+
+    return jsonify({
+        'cache_size': cache_size,
+        'max_ttl_seconds': CACHE_TTL_SECONDS,
+        'oldest_entry_seconds': max(age_stats) if age_stats else 0,
+        'newest_entry_seconds': min(age_stats) if age_stats else 0,
+        'average_age_seconds': sum(age_stats) / len(age_stats) if age_stats else 0,
+        'expired_entries': sum(1 for age in age_stats if age >= CACHE_TTL_SECONDS) if age_stats else 0
+    })
+
+
+@app.route('/api/cache/clear')
+def clear_cache():
+    """Clear all cached data"""
+    global PLANTUML_CACHE
+    cleared_count = len(PLANTUML_CACHE)
+    PLANTUML_CACHE = {}
+    logging.info(f"Cache cleared, removed {cleared_count} entries")
+    return jsonify({
+        'cleared_entries': cleared_count,
+        'status': 'cache_cleared'
+    })
+
+
+@app.route('/api/cache/cleanup')
+def cleanup_cache():
+    """Remove expired cache entries"""
+    global PLANTUML_CACHE
+    now = time.time()
+    expired_count = 0
+
+    keys_to_remove = []
+    for key, (cache_time, _) in PLANTUML_CACHE.items():
+        if now - cache_time >= CACHE_TTL_SECONDS:
+            keys_to_remove.append(key)
+            expired_count += 1
+
+    for key in keys_to_remove:
+        del PLANTUML_CACHE[key]
+
+    logging.info(f"Cache cleanup removed {expired_count} expired entries")
+    return jsonify({
+        'removed_entries': expired_count,
+        'remaining_entries': len(PLANTUML_CACHE),
+        'status': 'cleanup_completed'
+    })
+
+
 @app.route('/api/health')
 def health_check():
     """Health check endpoint"""
@@ -348,6 +494,7 @@ def health_check():
             'database': 'connected',
             'plantuml': 'available' if plantuml_ok else 'unavailable',
             'plantuml_server_url': PLANTUML_SERVER_URL,
+            'cache_size': len(PLANTUML_CACHE),
             'timestamp': datetime.now().isoformat()
         }
 
@@ -386,6 +533,30 @@ def get_wbs_svg():
     return get_diagram_svg()
 
 
+def periodic_cache_cleanup():
+    """Background thread to periodically clean expired cache entries"""
+    while True:
+        time.sleep(60)  # Check every minute
+        try:
+            now = time.time()
+            expired_count = 0
+
+            keys_to_remove = []
+            for key, (cache_time, _) in PLANTUML_CACHE.items():
+                if now - cache_time >= CACHE_TTL_SECONDS:
+                    keys_to_remove.append(key)
+                    expired_count += 1
+
+            for key in keys_to_remove:
+                del PLANTUML_CACHE[key]
+
+            if expired_count > 0:
+                logging.info(f"Background cache cleanup removed {expired_count} expired entries")
+
+        except Exception as e:
+            logging.error(f"Error in background cache cleanup: {e}")
+
+
 if __name__ == '__main__':
     # Check dependencies on startup
     logging.info("Starting Diagram Service...")
@@ -405,4 +576,9 @@ if __name__ == '__main__':
     else:
         logging.warning("PlantUML server: FAILED - make sure PlantUML server is running")
 
-    app.run(host='0.0.0.0', port=5000, debug=False)  # Отключаем debug для production
+    # Запускаем фоновый поток для очистки кэша
+    cleanup_thread = threading.Thread(target=periodic_cache_cleanup, daemon=True)
+    cleanup_thread.start()
+    logging.info("Background cache cleanup thread started")
+
+    app.run(host='0.0.0.0', port=5000, debug=False)

@@ -1,17 +1,13 @@
 version: '3.8'
 
 services:
-  # PlantUML как веб-сервис
   plantuml-server:
     image: plantuml/plantuml-server:tomcat
     container_name: plantuml-server
     restart: unless-stopped
-    ports:
-      - "8080:8080"  # Экспортируем порт для отладки
     networks:
       - diagram-network
 
-  # Flask приложение
   diagram-app:
     build: .
     container_name: diagram-app
@@ -30,7 +26,6 @@ services:
     networks:
       - diagram-network
 
-  # Nginx как обратный прокси
   nginx:
     image: nginx:alpine
     container_name: diagram-nginx
